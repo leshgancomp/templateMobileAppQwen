@@ -1,8 +1,15 @@
 /**
- * Хранилище токенов
- * Абстрагирует хранение auth данных (localStorage для веба, SecureStore для Expo)
+ * Хранилище токенов (platform-agnostic).
+ *
+ * Работает с любым StorageAdapter:
+ *   - localStorage (веб)
+ *   - expo-secure-store (React Native)
+ *   - AsyncStorage (React Native)
+ *
+ * Все методы — async, т.к. SecureStore асинхронный.
  */
 
+import type { StorageAdapter } from './storage-adapter';
 import { AuthToken } from './entities/AuthToken';
 
 const STORAGE_KEYS = {
@@ -15,54 +22,55 @@ const STORAGE_KEYS = {
   TOKEN_ID: 'auth_token_id',
 } as const;
 
-class TokenStorage {
-  private token: AuthToken | null = null;
+export class TokenStorage {
+  private adapter: StorageAdapter;
+  private cache: AuthToken | null = null;
+
+  constructor(adapter: StorageAdapter) {
+    this.adapter = adapter;
+  }
 
   /**
    * Сохраняет данные авторизации
    */
-  save(token: AuthToken): void {
-    this.token = token;
+  async save(token: AuthToken): Promise<void> {
+    this.cache = token;
 
-    try {
-      localStorage.setItem(STORAGE_KEYS.ACCESS_TOKEN, token.accessToken);
-      localStorage.setItem(STORAGE_KEYS.TOKEN_TYPE, token.tokenType);
-      localStorage.setItem(STORAGE_KEYS.EXPIRES_IN, String(token.expiresIn));
-      localStorage.setItem(STORAGE_KEYS.ISSUED_AT, String(token.issuedAt));
-      localStorage.setItem(STORAGE_KEYS.TOKEN_ID, token.id);
+    await this.adapter.setItem(STORAGE_KEYS.ACCESS_TOKEN, token.accessToken);
+    await this.adapter.setItem(STORAGE_KEYS.TOKEN_TYPE, token.tokenType);
+    await this.adapter.setItem(STORAGE_KEYS.EXPIRES_IN, String(token.expiresIn));
+    await this.adapter.setItem(STORAGE_KEYS.ISSUED_AT, String(token.issuedAt));
+    await this.adapter.setItem(STORAGE_KEYS.TOKEN_ID, token.id);
 
-      if (token.serverRefreshToken) {
-        localStorage.setItem(STORAGE_KEYS.REFRESH_TOKEN, token.serverRefreshToken);
-      }
-      if (token.refreshTokenExpiration) {
-        localStorage.setItem(STORAGE_KEYS.REFRESH_EXPIRATION, String(token.refreshTokenExpiration));
-      }
-    } catch {
-      // localStorage может быть недоступен
+    if (token.serverRefreshToken) {
+      await this.adapter.setItem(STORAGE_KEYS.REFRESH_TOKEN, token.serverRefreshToken);
+    }
+    if (token.refreshTokenExpiration) {
+      await this.adapter.setItem(STORAGE_KEYS.REFRESH_EXPIRATION, String(token.refreshTokenExpiration));
     }
   }
 
   /**
    * Загружает токен из хранилища
    */
-  load(): AuthToken | null {
-    if (this.token) return this.token;
+  async load(): Promise<AuthToken | null> {
+    if (this.cache) return this.cache;
 
     try {
-      const accessToken = localStorage.getItem(STORAGE_KEYS.ACCESS_TOKEN);
+      const accessToken = await this.adapter.getItem(STORAGE_KEYS.ACCESS_TOKEN);
       if (!accessToken) return null;
 
       const token = new AuthToken();
-      token.accessToken = accessToken;
-      token.tokenType = localStorage.getItem(STORAGE_KEYS.TOKEN_TYPE) || 'Bearer';
-      token.expiresIn = Number(localStorage.getItem(STORAGE_KEYS.EXPIRES_IN)) || 3600;
-      token.id = localStorage.getItem(STORAGE_KEYS.TOKEN_ID) || '';
+      token.accessToken = accessToken as string;
+      token.tokenType = (await this.adapter.getItem(STORAGE_KEYS.TOKEN_TYPE)) || 'Bearer';
+      token.expiresIn = Number(await this.adapter.getItem(STORAGE_KEYS.EXPIRES_IN)) || 3600;
+      token.id = (await this.adapter.getItem(STORAGE_KEYS.TOKEN_ID)) || '';
       token.type = 'auth-tokens';
-      (token as any).issuedAt = Number(localStorage.getItem(STORAGE_KEYS.ISSUED_AT)) || Date.now();
-      token.serverRefreshToken = localStorage.getItem(STORAGE_KEYS.REFRESH_TOKEN) || undefined;
-      token.refreshTokenExpiration = Number(localStorage.getItem(STORAGE_KEYS.REFRESH_EXPIRATION)) || undefined;
+      (token as any).issuedAt = Number(await this.adapter.getItem(STORAGE_KEYS.ISSUED_AT)) || Date.now();
+      token.serverRefreshToken = (await this.adapter.getItem(STORAGE_KEYS.REFRESH_TOKEN)) || undefined;
+      token.refreshTokenExpiration = Number(await this.adapter.getItem(STORAGE_KEYS.REFRESH_EXPIRATION)) || undefined;
 
-      this.token = token;
+      this.cache = token;
       return token;
     } catch {
       return null;
@@ -72,46 +80,49 @@ class TokenStorage {
   /**
    * Получает текущий access token
    */
-  getAccessToken(): string | null {
-    const token = this.load();
+  async getAccessToken(): Promise<string | null> {
+    const token = await this.load();
     return token?.accessToken || null;
   }
 
   /**
    * Получает текущий refresh token
    */
-  getRefreshToken(): string | null {
-    const token = this.load();
+  async getRefreshToken(): Promise<string | null> {
+    const token = await this.load();
     return token?.serverRefreshToken || null;
   }
 
   /**
    * Проверяет авторизован ли пользователь
    */
-  isAuthenticated(): boolean {
-    const token = this.load();
+  async isAuthenticated(): Promise<boolean> {
+    const token = await this.load();
     return !!token && !token.isExpired;
   }
 
   /**
    * Обновляет access token (после refresh)
    */
-  updateAccessToken(newToken: AuthToken): void {
-    this.token = null; // сбрасываем кэш
-    this.save(newToken);
+  async updateAccessToken(newToken: AuthToken): Promise<void> {
+    this.cache = null;
+    await this.save(newToken);
   }
 
   /**
    * Очищает хранилище
    */
-  clear(): void {
-    this.token = null;
-    try {
-      Object.values(STORAGE_KEYS).forEach((key) => localStorage.removeItem(key));
-    } catch {
-      // ignore
+  async clear(): Promise<void> {
+    this.cache = null;
+    for (const key of Object.values(STORAGE_KEYS)) {
+      await this.adapter.removeItem(key);
     }
   }
-}
 
-export const tokenStorage = new TokenStorage();
+  /**
+   * Сбрасывает кэш (например, после изменения storage извне)
+   */
+  invalidateCache(): void {
+    this.cache = null;
+  }
+}
